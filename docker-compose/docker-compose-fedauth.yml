@@ -1,0 +1,63 @@
+---
+version: '3'
+
+networks:
+  kafka_net:
+    # driver: bridge
+
+services:
+  zookeeper:
+    image: 'bitnami/zookeeper:3.6.3'
+    hostname: zookeeper
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ALLOW_ANONYMOUS_LOGIN: 'yes'
+    #   ZOOKEEPER_CLIENT_PORT: 2181
+    networks:
+      - kafka_net
+
+  kafka:
+    image: 'bitnami/kafka:2.8.1'
+    hostname: broker
+    container_name: broker
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    networks:
+      - kafka_net
+    environment:
+      ALLOW_PLAINTEXT_LISTENER: 'yes'
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_BROKER_ID: 1
+      
+      KAFKA_LISTENERS: DOCKER://broker:29092,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: DOCKER://broker:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: DOCKER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: DOCKER
+      
+  kafka-ws-proxy:
+    image: registry.gitlab.com/kpmeen/kafka-websocket-proxy/server:1.1.1-SNAPSHOT
+    hostname: kafka-ws-proxy
+    container_name: kafka-ws-proxy
+    ports:
+      - "8078:8078"
+    networks:
+      - kafka_net
+    depends_on:
+      - zookeeper
+      - kafka
+    environment:
+      - WSPROXY_KAFKA_BOOTSTRAP_HOSTS=broker:29092
+      - WSPROXY_BIND_INTERFACE=0.0.0.0
+      - WSPROXY_FEDERATED_AUTH_ENABLED=true
+      - WSPROXY_FEDERATED_AUTH_URI=http://172.17.0.1:12090/v1/login
+      - 'WSPROXY_FEDERATED_AUTH_BODY={"username": "{{user}}", "password": "{{pass}}"}'
+      - 'WSPROXY_FEDERATED_AUTH_MAPPING=HEADER:X-Violet-App-Id:X-Violet-App-Id,HEADER:X-Violet-App-Secret:X-Violet-App-Secret,BODY:X-Violet-User:user,BODY:X-Violet-Pass:pass'
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -f http://localhost:8087/healthcheck || exit 1']
+      interval: 30s
+      timeout: 3s
+      retries: 40
