@@ -92,6 +92,7 @@ lazy val server = (project in file("server"))
       Kafka.Clients,
       ConfluentKafka.AvroSerializer,
       ConfluentKafka.MonitoringInterceptors,
+      Circe.AkkaHttpSupport,
       Logging.Log4jOverSlf4j         % Test,
       Logging.JulToSlf4j             % Test,
       Testing.ScalaTest              % Test,

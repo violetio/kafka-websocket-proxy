@@ -15,6 +15,7 @@ import akka.stream.scaladsl.RunnableGraph
 import akka.util.Timeout
 import io.circe.syntax._
 import io.circe.{Json, Printer}
+import de.heikoseeberger.akkahttpcirce._
 import net.scalytica.kafka.wsproxy.admin.WsKafkaAdminClient
 import net.scalytica.kafka.wsproxy.auth.OpenIdClient
 import net.scalytica.kafka.wsproxy.avro.SchemaTypes.{
@@ -42,9 +43,13 @@ import net.scalytica.kafka.wsproxy.web.websockets.{
 import org.apache.avro.Schema
 import org.apache.kafka.common.KafkaException
 
+import java.util.concurrent.TimeUnit
 import scala.concurrent.duration._
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success, Try}
+import akka.http.scaladsl.Http
+import akka.util.ByteString
+import scala.concurrent.Await
 
 trait BaseRoutes extends QueryParamParsers with WithProxyLogger {
 
@@ -153,13 +158,114 @@ trait BaseRoutes extends QueryParamParsers with WithProxyLogger {
       }
   }
 
-  protected def maybeAuthenticate[T](
+  def askFederatedAuth(reqHeaders: Seq[HttpHeader])(
       implicit cfg: AppCfg,
+      as: ActorSystem,
+      ec: ExecutionContext
+  ): Future[Try[String]] = {
+
+    // configs optionals must be already validated
+    val authBody = cfg.server.federatedAuth.get.transformBody(reqHeaders)
+    val headers = Seq[HttpHeader]() ++ cfg.server.federatedAuth.get
+      .transformHeaders(reqHeaders)
+
+    val authUri = cfg.server.federatedAuth.get.uri.get
+
+    val futureRsp = for {
+      tokenReq <- {
+        logger.info(
+          s"auth.uri=${authUri}: requesting token:\nHeaders: ${headers}\nBody: ${authBody}"
+        )
+        val rsp = Http().singleRequest(
+          HttpRequest(
+            method = HttpMethods.POST,
+            uri = authUri,
+            entity = HttpEntity(ContentTypes.`application/json`, authBody),
+            headers = headers
+          )
+        )
+        rsp
+      }
+      tokenRsp <- {
+        logger.info(s"auth.uri=${authUri}: status=${tokenReq.status}")
+        if (tokenReq.status == StatusCodes.OK)(tokenReq.entity.dataBytes
+          .runFold(ByteString(""))(_ ++ _))
+          .map(Success(_))
+        else {
+          logger.error(
+            s"auth.uri=${authUri}: status=${tokenReq.status}: not authenticated"
+          )
+          Future(
+            Failure(
+              new Exception(s"not authenticated: headers=${headers}")
+            )
+          )
+        }
+      }
+      authRsp <- {
+        tokenRsp match {
+          case Success(rsp) => {
+            logger.info(s"tokenRsp: ${rsp.utf8String}")
+            // additional token validation here (e.g. JWT token validation)
+            Future(Success(rsp.utf8String))
+          }
+          case f @ Failure(_) => Future(Failure(f.exception))
+        }
+      }
+    } yield authRsp
+
+    futureRsp
+  }
+
+  protected def maybeAuthenticateFederated[T](
+      implicit headers: Seq[HttpHeader],
+      cfg: AppCfg,
+      as: ActorSystem,
+      ec: ExecutionContext
+  ): Directive1[WsProxyAuthResult] = {
+    import FailFastCirceSupport._
+    import io.circe.generic.auto._
+
+    logger.debug("Attempting authentication using Federated authentication...")
+    cfg.server.federatedAuth
+      .flatMap { fa =>
+        val od: Option[Directive1[WsProxyAuthResult]] =
+          if (fa.enabled) {
+
+            val r = Await.result(
+              askFederatedAuth(headers),
+              FiniteDuration(
+                fa.timeout,
+                TimeUnit.MILLISECONDS
+              )
+            )
+            r match {
+              case Success(r) => Some(provide(FederatedAuthResult(r)))
+              case Failure(e) => Some(complete(StatusCodes.Unauthorized))
+            }
+
+          } else None
+
+        od
+      }
+      .getOrElse {
+        logger.info("Federated authentication is not enabled.")
+        provide(AuthDisabled)
+      }
+  }
+
+  protected def maybeAuthenticate[T](
+      implicit headers: Seq[HttpHeader],
+      cfg: AppCfg,
       maybeOpenIdClient: Option[OpenIdClient],
-      mat: Materializer
+      mat: Materializer,
+      as: ActorSystem,
+      ec: ExecutionContext
   ): Directive1[WsProxyAuthResult] = {
     if (cfg.server.isOpenIdConnectEnabled) maybeAuthenticateOpenId[T]
     else if (cfg.server.isBasicAuthEnabled) maybeAuthenticateBasic[T]
+    else if (cfg.server.isFederatedAuthEnabled)
+      maybeAuthenticateFederated[T](headers, cfg, as, ec)
     else provide(AuthDisabled)
   }
 
@@ -443,20 +549,43 @@ trait StatusRoutes { self: BaseRoutes =>
       maybeOidcClient: Option[OpenIdClient]
   ): Route = {
     extractMaterializer { implicit mat =>
-      pathPrefix("kafka") {
-        pathPrefix("cluster") {
-          path("info") {
-            maybeAuthenticate(cfg, maybeOidcClient, mat)(_ => serveClusterInfo)
+      extractActorSystem { implicit as =>
+        extractExecutionContext { implicit ec =>
+          extractRequest { implicit req =>
+            pathPrefix("kafka") {
+              pathPrefix("cluster") {
+                path("info") {
+                  maybeAuthenticate(
+                    req.headers,
+                    cfg,
+                    maybeOidcClient,
+                    mat,
+                    as,
+                    ec
+                  ) { _ =>
+                    serveClusterInfo
+                  }
+                }
+              }
+            } ~
+              path("healthcheck") {
+                if (cfg.server.secureHealthCheckEndpoint) {
+                  maybeAuthenticate(
+                    req.headers,
+                    cfg,
+                    maybeOidcClient,
+                    mat,
+                    as,
+                    ec
+                  )(_ => serveHealthCheck)
+                } else {
+                  serveHealthCheck
+                }
+              }
+
           }
         }
-      } ~
-        path("healthcheck") {
-          if (cfg.server.secureHealthCheckEndpoint) {
-            maybeAuthenticate(cfg, maybeOidcClient, mat)(_ => serveHealthCheck)
-          } else {
-            serveHealthCheck
-          }
-        }
+      }
     }
   }
 }
@@ -475,26 +604,60 @@ trait SchemaRoutes { self: BaseRoutes =>
       maybeOpenIdClient: Option[OpenIdClient]
   ): Route = {
     extractMaterializer { implicit mat =>
-      pathPrefix("schemas") {
-        pathPrefix("avro") {
-          pathPrefix("producer") {
-            path("record") {
-              maybeAuthenticate(cfg, maybeOpenIdClient, mat) { _ =>
-                complete(avroSchemaString(AvroProducerRecord.schema))
-              }
-            } ~ path("result") {
-              maybeAuthenticate(cfg, maybeOpenIdClient, mat) { _ =>
-                complete(avroSchemaString(AvroProducerResult.schema))
-              }
-            }
-          } ~ pathPrefix("consumer") {
-            path("record") {
-              maybeAuthenticate(cfg, maybeOpenIdClient, mat) { _ =>
-                complete(avroSchemaString(AvroConsumerRecord.schema))
-              }
-            } ~ path("commit") {
-              maybeAuthenticate(cfg, maybeOpenIdClient, mat) { _ =>
-                complete(avroSchemaString(AvroCommit.schema))
+      extractActorSystem { implicit as =>
+        extractExecutionContext { implicit ec =>
+          extractRequest { implicit req =>
+            pathPrefix("schemas") {
+              pathPrefix("avro") {
+                pathPrefix("producer") {
+                  path("record") {
+                    maybeAuthenticate(
+                      req.headers,
+                      cfg,
+                      maybeOpenIdClient,
+                      mat,
+                      as,
+                      ec
+                    ) { _ =>
+                      complete(avroSchemaString(AvroProducerRecord.schema))
+                    }
+                  } ~ path("result") {
+                    maybeAuthenticate(
+                      req.headers,
+                      cfg,
+                      maybeOpenIdClient,
+                      mat,
+                      as,
+                      ec
+                    ) { _ =>
+                      complete(avroSchemaString(AvroProducerResult.schema))
+                    }
+                  }
+                } ~ pathPrefix("consumer") {
+                  path("record") {
+                    maybeAuthenticate(
+                      req.headers,
+                      cfg,
+                      maybeOpenIdClient,
+                      mat,
+                      as,
+                      ec
+                    ) { _ =>
+                      complete(avroSchemaString(AvroConsumerRecord.schema))
+                    }
+                  } ~ path("commit") {
+                    maybeAuthenticate(
+                      req.headers,
+                      cfg,
+                      maybeOpenIdClient,
+                      mat,
+                      as,
+                      ec
+                    ) { _ =>
+                      complete(avroSchemaString(AvroCommit.schema))
+                    }
+                  }
+                }
               }
             }
           }
@@ -583,28 +746,48 @@ trait WebSocketRoutes { self: BaseRoutes =>
       outbound: OutSocketArgs => Route
   )(implicit cfg: AppCfg, maybeOpenIdClient: Option[OpenIdClient]): Route = {
     extractMaterializer { implicit mat =>
-      pathPrefix("socket") {
-        path("in") {
-          maybeAuthenticate(cfg, maybeOpenIdClient, mat) { authResult =>
-            optionalHeaderValueByType(XKafkaAuthHeader) { headerCreds =>
-              val creds = extractKafkaCreds(authResult, headerCreds)
-              inParams { inArgs =>
-                val args = inArgs
-                  .withAclCredentials(creds)
-                  .withBearerToken(authResult.maybeBearerToken)
-                validateAndHandleWebSocket(args)(inbound(args))
-              }
-            }
-          }
-        } ~ path("out") {
-          maybeAuthenticate(cfg, maybeOpenIdClient, mat) { authResult =>
-            optionalHeaderValueByType(XKafkaAuthHeader) { headerCreds =>
-              val creds = extractKafkaCreds(authResult, headerCreds)
-              outParams { outArgs =>
-                val args = outArgs
-                  .withAclCredentials(creds)
-                  .withBearerToken(authResult.maybeBearerToken)
-                validateAndHandleWebSocket(args)(outbound(args))
+      extractActorSystem { implicit as =>
+        extractExecutionContext { implicit ec =>
+          extractRequest { implicit req =>
+            pathPrefix("socket") {
+              path("in") {
+                maybeAuthenticate(
+                  req.headers,
+                  cfg,
+                  maybeOpenIdClient,
+                  mat,
+                  as,
+                  ec
+                ) { authResult =>
+                  optionalHeaderValueByType(XKafkaAuthHeader) { headerCreds =>
+                    val creds = extractKafkaCreds(authResult, headerCreds)
+                    inParams { inArgs =>
+                      val args = inArgs
+                        .withAclCredentials(creds)
+                        .withBearerToken(authResult.maybeBearerToken)
+                      validateAndHandleWebSocket(args)(inbound(args))
+                    }
+                  }
+                }
+              } ~ path("out") {
+                maybeAuthenticate(
+                  req.headers,
+                  cfg,
+                  maybeOpenIdClient,
+                  mat,
+                  as,
+                  ec
+                ) { authResult =>
+                  optionalHeaderValueByType(XKafkaAuthHeader) { headerCreds =>
+                    val creds = extractKafkaCreds(authResult, headerCreds)
+                    outParams { outArgs =>
+                      val args = outArgs
+                        .withAclCredentials(creds)
+                        .withBearerToken(authResult.maybeBearerToken)
+                      validateAndHandleWebSocket(args)(outbound(args))
+                    }
+                  }
+                }
               }
             }
           }

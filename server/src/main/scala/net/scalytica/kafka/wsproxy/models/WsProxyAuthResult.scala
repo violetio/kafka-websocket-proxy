@@ -88,6 +88,6 @@ case class JwtAuthResult(
 
 }
 
-case class BasicAuthResult(id: String) extends WsProxyAuthResult
-
-case object AuthDisabled extends WsProxyAuthResult
+case class BasicAuthResult(id: String)     extends WsProxyAuthResult
+case class FederatedAuthResult(id: String) extends WsProxyAuthResult
+case object AuthDisabled                   extends WsProxyAuthResult

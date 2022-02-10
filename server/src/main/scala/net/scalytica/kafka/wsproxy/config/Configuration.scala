@@ -18,6 +18,8 @@ import pureconfig.{ConfigReader, ConfigSource}
 import java.nio.file.Path
 import scala.concurrent.duration.FiniteDuration
 import scala.jdk.CollectionConverters._
+import akka.http.scaladsl.model.headers.RawHeader
+import akka.http.scaladsl.model.HttpHeader
 
 object Configuration extends WithProxyLogger {
 
@@ -338,6 +340,96 @@ object Configuration extends WithProxyLogger {
       customJwt.exists(_.kafkaTokenAuthOnly)
   }
 
+  final case class FederatedAuthCfg(
+      uri: Option[String],
+      mapping: Option[String],
+      body: Option[String],
+      timeout: Long = 5000L,
+      enabled: Boolean = false
+  ) {
+    if (enabled)
+      require(
+        uri.isDefined,
+        "uri are required when federated auth is enabled"
+      )
+
+    val transformers = getTransfomers(mapping.getOrElse(""))
+
+    final case class ProxyTransformer(t: String, k: String, v: String)
+
+    def getTransfomers(cfg: String): Seq[ProxyTransformer] = {
+      if (cfg.isEmpty) return Seq()
+      cfg
+        .split(",")
+        .map(_.trim)
+        .map(s => {
+          s.split(":") match {
+            case Array(t, k, v) =>
+              ProxyTransformer(t.trim.toUpperCase, k.trim, v.trim)
+            case Array(k, v) => ProxyTransformer("BODY", k.trim, v.trim)
+          }
+        })
+    }
+
+    def mapTransfomers(
+        reqHeaders: Seq[HttpHeader],
+        tt: Seq[ProxyTransformer]
+    ): Seq[ProxyTransformer] = {
+      tt.flatMap(t => {
+        reqHeaders.flatMap(h => {
+          if (h.name == t.k) Some(t.copy(k = t.v, v = h.value))
+          else None
+        })
+      })
+    }
+
+    def transformBody(reqHeaders: Seq[HttpHeader]): String =
+      transformBody(reqHeaders, transformers)
+
+    def transformBody(
+        reqHeaders: Seq[HttpHeader],
+        trs: Seq[ProxyTransformer]
+    ): String = {
+      if (!this.body.isDefined || this.body.isEmpty) return ""
+
+      val tt = mapTransfomers(reqHeaders, trs)
+
+      var body = this.body.get
+      for (t <- tt if t.t == "BODY") {
+        body = body.replaceAll("""\{\{""" + t.k + """\}\}""", s"${t.v}")
+      }
+      body
+    }
+
+    def transformHeaders(reqHeaders: Seq[HttpHeader]): Seq[HttpHeader] =
+      transformHeaders(reqHeaders, transformers)
+
+    def transformHeaders(
+        reqHeaders: Seq[HttpHeader],
+        trs: Seq[ProxyTransformer]
+    ): Seq[HttpHeader] = {
+      val tt = mapTransfomers(reqHeaders, trs)
+      tt.filter(_.t.toUpperCase == "HEADER")
+        .flatMap(t => {
+          t.v match {
+            // place for other matchers
+            case qv => {
+              // try to get from property and then from envvar and then from value
+              val v = qv.replaceAll("\\{\\{", "").replaceAll("\\}\\}", "")
+              Seq(
+                Option(System.getenv(v)),
+                Option(System.getProperty(v)),
+                Option(v)
+              ).flatten.headOption match {
+                case Some(v) => Some(RawHeader(t.k, v))
+                case _       => None
+              }
+            }
+          }
+        })
+    }
+  }
+
   final case class JmxConfig(manager: JmxManagerConfig)
 
   case class JmxManagerConfig(proxyStatusInterval: FiniteDuration)
@@ -353,6 +445,7 @@ object Configuration extends WithProxyLogger {
       secureHealthCheckEndpoint: Boolean,
       basicAuth: Option[BasicAuthCfg],
       openidConnect: Option[OpenIdConnectCfg],
+      federatedAuth: Option[FederatedAuthCfg],
       jmx: JmxConfig
   ) {
 
@@ -370,6 +463,9 @@ object Configuration extends WithProxyLogger {
 
     def isOpenIdConnectEnabled: Boolean =
       openidConnect.isDefined && openidConnect.exists(_.enabled)
+
+    def isFederatedAuthEnabled: Boolean =
+      federatedAuth.isDefined && federatedAuth.exists(_.enabled)
 
     def isKafkaTokenAuthOnlyEnabled: Boolean =
       openidConnect.exists(_.isKafkaTokenAuthOnlyEnabled)
