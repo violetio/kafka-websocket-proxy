@@ -8,7 +8,16 @@ Authnetication will be perfromed on WebSocket connection handshake
 <img src="Architecture-Violet-kafka-websocket-proxy.jpg" width="650">
 
 
-### Configuration
+----
+
+## Build Docker image
+
+```
+sbt docker:publishLocal
+```
+
+
+## Configuration
 
 | Parameter | Value | Description |
 | ----------|-------|-------------|
