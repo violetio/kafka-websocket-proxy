@@ -1,4 +1,4 @@
-# Authenticationa and Authorization
+# Authentication and Authorization
 
 
 ## Federated Auth 
